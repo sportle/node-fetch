@@ -16,8 +16,12 @@ var Body = require('./lib/body');
 var Response = require('./lib/response');
 var Headers = require('./lib/headers');
 var Request = require('./lib/request');
+var FetchError = require('./lib/fetch-error');
 
+// commonjs
 module.exports = Fetch;
+// es6 default export compatibility
+module.exports.default = module.exports;
 
 /**
  * Fetch class
@@ -44,12 +48,14 @@ function Fetch(url, opts) {
 	// wrap http.request into fetch
 	return new Fetch.Promise(function(resolve, reject) {
 		// build request object
-		var options;
-		try {
-			options = new Request(url, opts);
-		} catch (err) {
-			reject(err);
-			return;
+		var options = new Request(url, opts);
+
+		if (!options.protocol || !options.hostname) {
+			throw new Error('only absolute urls are supported');
+		}
+
+		if (options.protocol !== 'http:' && options.protocol !== 'https:') {
+			throw new Error('only http(s) protocols are supported');
 		}
 
 		var send;
@@ -70,7 +76,7 @@ function Fetch(url, opts) {
 			headers.set('user-agent', 'node-fetch/1.0 (+https://github.com/bitinn/node-fetch)');
 		}
 
-		if (!headers.has('connection')) {
+		if (!headers.has('connection') && !options.agent) {
 			headers.set('connection', 'close');
 		}
 
@@ -83,10 +89,13 @@ function Fetch(url, opts) {
 			headers.set('content-type', 'multipart/form-data; boundary=' + options.body.getBoundary());
 		}
 
-		// bring node-fetch closer to browser behavior by setting content-length automatically for POST, PUT, PATCH requests when body is empty or string
-		if (!headers.has('content-length') && options.method.substr(0, 1).toUpperCase() === 'P') {
+		// bring node-fetch closer to browser behavior by setting content-length automatically
+		if (!headers.has('content-length') && /post|put|patch|delete/i.test(options.method)) {
 			if (typeof options.body === 'string') {
 				headers.set('content-length', Buffer.byteLength(options.body));
+			// detect form data input from form-data module, this hack avoid the need to add content-length header manually
+			} else if (options.body && typeof options.body.getLengthSync === 'function' && options.body._lengthRetrievers.length == 0) {
+				headers.set('content-length', options.body.getLengthSync().toString());
 			// this is only necessary for older nodejs releases (before iojs merge)
 			} else if (options.body === undefined || options.body === null) {
 				headers.set('content-length', '0');
@@ -108,23 +117,33 @@ function Fetch(url, opts) {
 			req.once('socket', function(socket) {
 				reqTimeout = setTimeout(function() {
 					req.abort();
-					reject(new Error('network timeout at: ' + options.url));
+					reject(new FetchError('network timeout at: ' + options.url, 'request-timeout'));
 				}, options.timeout);
 			});
 		}
 
 		req.on('error', function(err) {
 			clearTimeout(reqTimeout);
-			reject(new Error('request to ' + options.url + ' failed, reason: ' + err.message));
+			reject(new FetchError('request to ' + options.url + ' failed, reason: ' + err.message, 'system', err));
 		});
 
 		req.on('response', function(res) {
 			clearTimeout(reqTimeout);
 
 			// handle redirect
-			if (self.isRedirect(res.statusCode) && options.counter < options.follow) {
+			if (self.isRedirect(res.statusCode) && options.redirect !== 'manual') {
+				if (options.redirect === 'error') {
+					reject(new FetchError('redirect mode is set to error: ' + options.url, 'no-redirect'));
+					return;
+				}
+
+				if (options.counter >= options.follow) {
+					reject(new FetchError('maximum redirect reached at: ' + options.url, 'max-redirect'));
+					return;
+				}
+
 				if (!res.headers.location) {
-					reject(new Error('redirect location header missing at: ' + options.url));
+					reject(new FetchError('redirect location header missing at: ' + options.url, 'invalid-redirect'));
 					return;
 				}
 
@@ -150,17 +169,26 @@ function Fetch(url, opts) {
 			if (options.compress && headers.has('content-encoding')) {
 				var name = headers.get('content-encoding');
 
-				if (name == 'gzip' || name == 'x-gzip') {
-					body = body.pipe(zlib.createGunzip());
-				} else if (name == 'deflate' || name == 'x-deflate') {
-					body = body.pipe(zlib.createInflate());
+				// no need to pipe no content and not modified response body
+				if (res.statusCode !== 204 && res.statusCode !== 304) {
+					if (name == 'gzip' || name == 'x-gzip') {
+						body = body.pipe(zlib.createGunzip());
+					} else if (name == 'deflate' || name == 'x-deflate') {
+						body = body.pipe(zlib.createInflate());
+					}
 				}
+			}
+
+			// normalize location header for manual redirect mode
+			if (options.redirect === 'manual' && headers.has('location')) {
+				headers.set('location', resolve_url(options.url, headers.get('location')));
 			}
 
 			// response object
 			var output = new Response(body, {
 				url: options.url
 				, status: res.statusCode
+				, statusText: res.statusMessage
 				, headers: headers
 				, size: options.size
 				, timeout: options.timeout
